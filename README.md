@@ -1,6 +1,8 @@
 
 ## E-Commerce Data Integration & Cleaning System ##
-Architecture Documentation v1.0
+
+ # Architecture Documentation v1.0 #
+
 
 Document Purpose & Audience
 This documentation is structured in three layers:
