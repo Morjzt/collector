@@ -232,9 +232,7 @@ class StageExecutor:
             None if failed (error stored in self.errors)
         """
 
-        in_count = len(payload) if isinstance(payload, (list, dict)) else 1
         try:
-            config = StageConfig.get_config(stage_key)
             self.circuit_breaker.check(stage_key, payload)
             
             result = self.engine.wrap_stage(
