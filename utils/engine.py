@@ -223,7 +223,7 @@ class StageExecutor:
         self.results: Dict[str, Any] = {}  
         self.errors: Dict[str, Dict[str, str]] = {}   
     
-    def run_stage(self, stage_key: str, func: Callable, payload: Dict, **kwargs) -> Dict:
+    def run_stage(self, stage_key: str, func: Callable, payload: Any, **kwargs) -> Any:
         """
         Run a single stage with fault isolation.
         
@@ -235,14 +235,21 @@ class StageExecutor:
         try:
             self.circuit_breaker.check(stage_key, payload)
             
+            # Record Input count
+            in_count = len(payload) if hasattr(payload, '__len__') else 1
+
             result = self.engine.wrap_stage(
                 stage_name=stage_key,
                 func=func,
-                payload=payload,
+                payload=payload, # Fixed: passing payload as positional arg
                 **kwargs
             )
             
+            # Record Output count
+            out_count = len(result) if hasattr(result, '__len__') else (1 if result is not None else 0)
+            
             self.results[stage_key] = result
+            self.telemetry.record_io(stage_key, in_count, out_count)
             self.telemetry.counts[f"{stage_key}_success"] += 1
             
             return result
@@ -315,23 +322,24 @@ class TelemetryMonolith:
         self.cpu = CPUMonitor(self._proc)
         self.ram = MemoryTracking(self._proc)
         self.logger = logger
-
         self.latencies = collections.defaultdict(InvariantDeque)
         self.ram_deltas = collections.defaultdict(list)  
         self.counts = collections.Counter()
         self.io_metrics = collections.defaultdict(lambda: {"in": 0, "out": 0})
+        self.cpu_pcts = collections.defaultdict(InvariantDeque)
 
     def record_io(self, stage: str, count_in: int, count_out: int):
       # Captures record counts I/O for batch metadata 
         self.io_metrics[stage]["in"] += count_in
         self.io_metrics[stage]["out"] += count_out
 
-    def record(self, stage: str, wall_time: float, cpu_delta: float, ram_delta: float):
-        """MODIFIED: Now accepts ram_delta"""
-        self.latencies[stage].add(wall_time)
-        self.ram_deltas[stage].append(ram_delta) 
-        self.counts[f"{stage}_cpu_total"] += cpu_delta
+    def record(self, stage: str, wall_ms: float, cpu_diff: float, ram_delta: float):
+        self.latencies[stage].add(wall_ms)
+        self.ram_deltas[stage].append(ram_delta)
         self.counts[f"{stage}_hits"] += 1
+        
+        cpu_pct = (cpu_diff / (wall_ms / 1000.0)) * 100 if wall_ms > 0 else 0
+        self.cpu_pcts[stage].add(cpu_pct)
 
     def report(self):
         stats = {
@@ -339,6 +347,7 @@ class TelemetryMonolith:
             "stages": {
                 stage: {
                     "avg_wall_ms": round(deque.get_average(), 4),
+                    "avg_cpu_ms": round((self.counts[f"{stage}_cpu_total"] * 1000) / self.counts[f"{stage}_hits"], 4) if self.counts[f"{stage}_hits"] > 0 else 0,
                     "total_runs": self.counts[f"{stage}_hits"],
                     "records_in": self.io_metrics[stage]["in"],
                     "records_out": self.io_metrics[stage]["out"],
@@ -350,7 +359,6 @@ class TelemetryMonolith:
             }
         }
         
-        # IMPROVED: Better formatted output
         self.logger.info("=" * 60)
         self.logger.info("TELEMETRY REPORT")
         self.logger.info("=" * 60)
@@ -360,14 +368,14 @@ class TelemetryMonolith:
         for stage_name, metrics in stats['stages'].items():
             self.logger.info(f"Stage: {stage_name}")
             self.logger.info(f"  Avg Wall Time: {metrics['avg_wall_ms']:.4f} ms")
+            # ADDED THIS LOG LINE:
+            self.logger.info(f"  Avg CPU Time:  {metrics['avg_cpu_ms']:.4f} ms") 
             self.logger.info(f"  Avg RAM Delta: {metrics['avg_ram_delta_MB']:.2f} MB")
-            self.logger.info(f"  Total Runs: {metrics['total_runs']}")
-            self.logger.info(f"  Success: {metrics['success_count']}")
-            self.logger.info(f"  Failure: {metrics['failure_count']}")
+            self.logger.info(f"  Yield Ratio:   {metrics['yield_ratio']}")
+            self.logger.info(f"  Total Runs: {metrics['total_runs']} (S: {metrics['success_count']} / F: {metrics['failure_count']})")
             self.logger.info("")
         
         self.logger.info("=" * 60)
-
 
 # <------ Engine Implementation ------>
 
@@ -421,15 +429,15 @@ class CollectorEngine:
             logger.addHandler(ch)
         return logger
 
-    def wrap_stage(self, stage_name: str, func: Callable, *args, **kwargs):
+    def wrap_stage(self, stage_name: str, func: Callable, payload: Any, *args, **kwargs):
         # 1. Start Snapshot
         ram0 = self.telemetry.ram.get_mb()
         t0 = time.perf_counter_ns()
         cpu0 = self.telemetry.cpu.get_thread_time()
         
         try:
-           # 2. Actual work
-            result = func(*args, **kwargs)
+            # 2. Actual work - Passing payload as positional argument
+            result = func(payload, *args, **kwargs)
             return result
         finally:
             # 3. End Snapshot (Even if it fails, the attempt must be recorded.)
@@ -445,79 +453,56 @@ class CollectorEngine:
             self.telemetry.record(stage_name, wall_ms, cpu_diff, ram_diff)
 
 
+# The "Hell Dataset" - Designed to trigger every Circuit Breaker and Telemetry Gauge
+hell_dataset = [
+    # 1. THE BUNDLE BOMB (Circuit Breaker Test)
+    # Objective: Trigger the rejection of non-atomic batches.
+    ["item_1", {"id": 2}, [3, 4, 5]], 
+
+    # 2. THE MEMORY HOG (RAM Delta Test)
+    # Objective: Force a massive delta between ram0 and ram1 to test your Gauge.
+    {"id": "MEM_SPIKE", "data": bytearray(1024 * 1024 * 50)}, # 50MB allocation
+
+    # 3. THE PII OBFUSCATOR (Scrubber Test)
+    # Objective: Test if your regex catches emails buried in nested structures.
+    {
+        "user": "legit_user", 
+        "meta": {"contact": "hidden_leak@malicious.com", "logs": "found user: ceo@company.org"}
+    },
+
+    # 4. THE TYPE ANARCHIST (Data Quality/Yield Test)
+    # Objective: Send types that break standard dict.get() logic.
+    {None: "null_key", "price": "THIRTY_DOLLARS", "inventory": float('nan')},
+
+    # 5. THE RECURSIVE TRAP (CPU/Wall Time Test)
+    # Objective: If your logic tries to deep-copy or serialize this, it may hang.
+    (lambda: {
+        "infinite": "loop"
+    })(), # Passing a raw callable or a self-referencing object
+
+    # 6. THE HASHED GHOST (Empty Yield Test)
+    # Objective: A record that exists but has 0 usable content (Yield 1 -> 0).
+    {} 
+]
+
+
 if __name__ == "__main__":
-    engine = CollectorEngine(name="DataPipeline")
+
+    engine = CollectorEngine("StressTester")
     executor = StageExecutor(engine)
-    
-    def fetch_data(platform: str):
-        time.sleep(0.01)
-        return {"id": "123", "title": "  Product  ", "price": None, "inventory": 10}
-    
-    def sanitize_data(record: dict):
-        sanitized = record.copy()
-        if isinstance(sanitized.get('title'), str):
-            sanitized['title'] = sanitized['title'].strip()
-        return sanitized
-    
-    def validate_data(record: dict):
-        errors = []
-        if not record.get('title'):
-            errors.append("Missing title")
-        if record.get('price') is None:
-            errors.append("Missing price")
-        
-        if errors:
-            raise ValueError(f"Validation failed: {errors}")
-        return record
-    
-    def correct_data(record: dict):
-        corrected = record.copy()
-        if corrected.get('price') is None:
-            corrected['price'] = 0.0
-        return corrected
-    
-    # Test 1: Successful pipeline
-    print("\n" + "="*60)
-    print("TEST 1: Successful Pipeline (with correction)")
-    print("="*60)
-    
-    pipeline_stages = [
-        (StageConfig.FETCH, fetch_data),
-        (StageConfig.SANITIZE, sanitize_data),
-        # Skip validate (will fail), go straight to correct
-        (StageConfig.CORRECT, correct_data),
-    ]
-    
-    result = executor.run_pipeline(pipeline_stages, "shopify")
-    
-    print("\nPipeline Results:")
-    print(f"  Successful stages: {list(result['results'].keys())}")
-    print(f"  Failed stages: {list(result['errors'].keys())}")
-    print(f"  Final payload: {result['final_payload']}")
-    
-    # Test 2: Pipeline with validation failure
-    print("\n" + "="*60)
-    print("TEST 2: Pipeline with Validation Failure")
-    print("="*60)
-    
-    executor2 = StageExecutor(engine)
-    
-    pipeline_stages2 = [
-        (StageConfig.FETCH, fetch_data),
-        (StageConfig.SANITIZE, sanitize_data),
-        (StageConfig.VALIDATE, validate_data), 
-        (StageConfig.CORRECT, correct_data),
-    ]
-    
-    result2 = executor2.run_pipeline(pipeline_stages2, "shopify")
-    
-    print("\nPipeline Results:")
-    print(f"  Successful stages: {list(result2['results'].keys())}")
-    print(f"  Failed stages: {list(result2['errors'].keys())}")
-    if result2['errors']:
-        for stage, error in result2['errors'].items():
-            print(f"  Error in {stage}: {error['type']} - {error['message']}")
-    
-    # Telemetry report
-    print("\n")
+
+    # Use a dummy function that just passes data through to see where the engine breaks
+    def pass_through(data): return data
+
+    print("STAGING HELL DATASET...")
+    for i, pill in enumerate(hell_dataset):
+        print(f"Testing Pill #{i}...")
+        try:
+            # We use SANITIZE to trigger the dict-only policy
+            executor.run_stage(StageConfig.SANITIZE, pass_through, pill)
+        except Exception as e:
+            # The engine should catch these, log them, and keep moving
+            continue
+
+    # Final verification of your Gauges
     engine.telemetry.report()
